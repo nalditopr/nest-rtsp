@@ -1,0 +1,27 @@
+name: "Nest RTSP"
+description: "Direct 1080p 30fps RTSP from Google Nest cameras — no Chrome, no cloud relay"
+version: "1.0.0"
+slug: nest-rtsp
+url: "https://github.com/nalditopr/nest-rtsp"
+arch:
+  - amd64
+host_network: true
+ingress: true
+ingress_port: 3000
+panel_icon: "mdi:cctv"
+ports:
+  8554/tcp: 8554
+ports_description:
+  8554/tcp: "RTSP streams"
+map:
+  - addon_config:rw
+  - share:rw
+options:
+  cameras: []
+  cookies_json: ""
+schema:
+  cameras:
+    - name: str
+      device_id: str
+      resolution: int(0,3)?
+  cookies_json: str?
