@@ -282,19 +282,21 @@ func connectCamera(cs *cameraStream, server *gortsplib.Server, cookies map[strin
 			pc.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: uint32(track.SSRC())}})
 
 			// Forward RTP packets and log stats
-			var packets, bytes uint64
+			var packets, totalBytes uint64
+			var frames uint64
+			var lastTimestamp uint32
 			var firstPkt time.Time
 			statsTimer := time.NewTicker(10 * time.Second)
 			defer statsTimer.Stop()
 
-			// Log resolution from first SPS NAL unit
 			go func() {
 				for range statsTimer.C {
 					elapsed := time.Since(firstPkt).Seconds()
-					if elapsed > 0 && packets > 0 {
-						fps := float64(packets) / elapsed
-						mbps := float64(bytes) * 8 / elapsed / 1e6
-						log.Printf("[%s] %s %.0ffps %.2fMbps (%d pkts)", cs.name, codec.MimeType, fps, mbps, packets)
+					if elapsed > 0 && frames > 0 {
+						fps := float64(frames) / elapsed
+						mbps := float64(totalBytes) * 8 / elapsed / 1e6
+						log.Printf("[%s] %s %dx — %.1ffps %.2fMbps (%d frames, %d pkts)",
+							cs.name, codec.MimeType, 0, fps, mbps, frames, packets)
 					}
 				}
 			}()
@@ -311,14 +313,13 @@ func connectCamera(cs *cameraStream, server *gortsplib.Server, cookies map[strin
 
 				if firstPkt.IsZero() {
 					firstPkt = time.Now()
-					// Parse H.264 SPS for resolution
-					nalType := pkt.Payload[0] & 0x1f
-					if nalType == 7 { // SPS
-						log.Printf("[%s] got SPS, resolution will appear in stats", cs.name)
-					}
 				}
 				packets++
-				bytes += uint64(len(pkt.Payload))
+				totalBytes += uint64(len(pkt.Payload))
+				if pkt.Timestamp != lastTimestamp {
+					frames++
+					lastTimestamp = pkt.Timestamp
+				}
 
 				cs.mu.RLock()
 				s := cs.stream
