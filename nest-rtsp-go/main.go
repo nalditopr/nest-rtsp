@@ -242,6 +242,13 @@ func connectCamera(cs *cameraStream, server *gortsplib.Server, cookies map[strin
 	trackReady := make(chan struct{}, 1)
 
 	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[%s] recovered from panic in track handler: %v", cs.name, r)
+				done <- fmt.Errorf("panic: %v", r)
+			}
+		}()
+
 		codec := track.Codec()
 		log.Printf("[%s] track: %s codec=%s pt=%d", cs.name, track.Kind(), codec.MimeType, codec.PayloadType)
 
@@ -327,7 +334,10 @@ func connectCamera(cs *cameraStream, server *gortsplib.Server, cookies map[strin
 				cs.mu.RUnlock()
 
 				if s != nil && m != nil {
-					s.WritePacketRTP(m, pkt)
+					func() {
+						defer func() { recover() }()
+						s.WritePacketRTP(m, pkt)
+					}()
 				}
 			}
 		}
