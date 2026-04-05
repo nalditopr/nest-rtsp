@@ -142,15 +142,7 @@ func main() {
 	}
 	log.Printf("nest-rtsp started — %d cameras, RTSP on :%d", len(config.Cameras), config.RTSPPort)
 
-	// Start each camera with staggered reconnect offsets
-	// so they don't all reconnect at the same time
-	cameraIndex := 0
-	numCameras := 0
-	for _, cam := range config.Cameras {
-		if cam.DeviceID != "" {
-			numCameras++
-		}
-	}
+	// Start each camera
 	for name, cam := range config.Cameras {
 		if cam.DeviceID == "" {
 			continue
@@ -160,11 +152,7 @@ func main() {
 		handler.cameras[name] = cs
 		handler.mu.Unlock()
 
-		// Stagger: each camera gets a different reconnect offset
-		// so reconnects are spread across the 4m30s window
-		stagger := time.Duration(cameraIndex) * (4*time.Minute + 30*time.Second) / time.Duration(numCameras)
-		go startCamera(cs, handler.server, cookies, config.APIKey, stagger)
-		cameraIndex++
+		go startCamera(cs, handler.server, cookies, config.APIKey)
 		time.Sleep(500 * time.Millisecond)
 	}
 
@@ -176,16 +164,10 @@ func main() {
 	handler.server.Close()
 }
 
-func startCamera(cs *cameraStream, server *gortsplib.Server, cookies map[string]string, apiKey string, initialStagger time.Duration) {
-	// Apply initial stagger so cameras reconnect at different times
-	if initialStagger > 0 {
-		log.Printf("[%s] stagger: first reconnect offset %v", cs.name, initialStagger)
-	}
-	firstRun := true
+func startCamera(cs *cameraStream, server *gortsplib.Server, cookies map[string]string, apiKey string) {
 	failures := 0
 	for {
-		err := connectCamera(cs, server, cookies, apiKey, firstRun, initialStagger)
-		firstRun = false
+		err := connectCamera(cs, server, cookies, apiKey)
 		if err != nil {
 			failures++
 			delay := min(2*time.Second*time.Duration(1<<min(failures-1, 7)), 5*time.Minute)
@@ -197,7 +179,7 @@ func startCamera(cs *cameraStream, server *gortsplib.Server, cookies map[string]
 	}
 }
 
-func connectCamera(cs *cameraStream, server *gortsplib.Server, cookies map[string]string, apiKey string, firstRun bool, stagger time.Duration) error {
+func connectCamera(cs *cameraStream, server *gortsplib.Server, cookies map[string]string, apiKey string) error {
 	log.Printf("[%s] connecting to %s", cs.name, cs.config.DeviceID)
 
 	// Auth
@@ -443,23 +425,28 @@ func connectCamera(cs *cameraStream, server *gortsplib.Server, cookies map[strin
 		return fmt.Errorf("timeout waiting for video track")
 	}
 
-	// Proactive reconnect before Google kills us (~5.5min session limit)
-	// First run uses stagger offset so cameras reconnect at different times
-	reconnectDuration := 4*time.Minute + 30*time.Second
-	if firstRun && stagger > 0 {
-		reconnectDuration = stagger
-	}
-	reconnectTimer := time.NewTimer(reconnectDuration)
-	defer reconnectTimer.Stop()
+	// Keepalive: send PLI every 30 seconds to keep the session alive
+	// (Chrome browser keeps sessions open for days — the 5.5min timeout
+	// was likely caused by lack of RTCP feedback after initial connection)
+	keepaliveTicker := time.NewTicker(30 * time.Second)
+	defer keepaliveTicker.Stop()
 
-	select {
-	case err = <-done:
-		// Connection dropped by Google or network error
-	case <-reconnectTimer.C:
-		// Proactive reconnect — prevents the 5.5min Google timeout
-		log.Printf("[%s] proactive reconnect (4m30s)", cs.name)
-		err = nil
-	}
+	go func() {
+		for range keepaliveTicker.C {
+			videoReceiver := pc.GetReceivers()
+			for _, r := range videoReceiver {
+				if r.Track() != nil && r.Track().Kind() == webrtc.RTPCodecTypeVideo {
+					pc.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{
+						MediaSSRC: uint32(r.Track().SSRC()),
+					}})
+				}
+			}
+		}
+	}()
+
+	// Block until connection drops — no proactive reconnect
+	// Keepalive PLI should prevent Google from killing the session
+	err = <-done
 
 	cs.mu.Lock()
 	if cs.stream != nil {
