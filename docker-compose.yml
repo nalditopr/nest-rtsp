@@ -1,0 +1,11 @@
+services:
+  nest-rtsp:
+    build: .
+    container_name: nest-rtsp
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./data:/data
+      - ./config.yaml:/app/config.yaml:ro
+    environment:
+      - STREAM_MODE=pion

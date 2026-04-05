@@ -1,0 +1,26 @@
+# nest-rtsp configuration
+# Copy this to config.yaml and edit with your camera device IDs.
+
+# Cookie storage (auto-managed)
+cookies_file: /data/cookies.json
+chrome_profile: /data/chrome-profile
+cookie_refresh_hours: 6
+
+# Ports
+rtsp_port: 8554          # RTSP output (cameras at rtsp://host:8554/{name})
+cookie_server_port: 3000  # Cookie management UI
+
+# Stream mode: 'pion' (30fps, recommended) or 'direct' (10fps, lightweight fallback)
+stream_mode: pion
+
+# Google Foyer API key (default works for all users)
+api_key: AIzaSyCMqap8NH88PrhvoBwY1W8ChRUJRjIOJXM
+
+# Cameras — find device IDs via browser DevTools (see README)
+cameras:
+  # front_door:
+  #   device_id: DEVICE_XXXXXXXXXXXXXXXX
+  #   resolution: 3    # 0=low, 1=SD, 2=HD, 3=Full (1080p)
+  # backyard:
+  #   device_id: DEVICE_YYYYYYYYYYYYYYYY
+  #   resolution: 3
