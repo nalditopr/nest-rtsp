@@ -1,42 +1,49 @@
-#!/usr/bin/with-contenv bashio
+#!/bin/bash
 # nest-rtsp Home Assistant add-on
 
 CONFIG_DIR="/data"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 COOKIES_FILE="${CONFIG_DIR}/cookies.json"
+OPTIONS="/data/options.json"
 
-bashio::log.info "Starting Nest RTSP add-on..."
+echo "[nest-rtsp] Starting..."
 
-# Build config.yaml from HA add-on options
-{
-  echo "cookies_file: ${COOKIES_FILE}"
-  echo "rtsp_port: 8554"
-  echo "cameras:"
+# Parse HA add-on options.json into our config format
+if [ -f "${OPTIONS}" ]; then
+  {
+    echo "cookies_file: ${COOKIES_FILE}"
+    echo "rtsp_port: 8554"
+    echo "cameras:"
 
-  for camera in $(bashio::config 'cameras|keys'); do
-    name=$(bashio::config "cameras[${camera}].name")
-    device_id=$(bashio::config "cameras[${camera}].device_id")
-    resolution=$(bashio::config "cameras[${camera}].resolution" 3)
-    echo "  ${name}:"
-    echo "    device_id: ${device_id}"
-    echo "    resolution: ${resolution}"
-  done
-} > "${CONFIG_FILE}"
+    # Parse cameras array from options.json
+    camera_count=$(jq '.cameras | length' "${OPTIONS}")
+    for i in $(seq 0 $((camera_count - 1))); do
+      name=$(jq -r ".cameras[$i].name" "${OPTIONS}")
+      device_id=$(jq -r ".cameras[$i].device_id" "${OPTIONS}")
+      resolution=$(jq -r ".cameras[$i].resolution // 3" "${OPTIONS}")
+      echo "  ${name}:"
+      echo "    device_id: ${device_id}"
+      echo "    resolution: ${resolution}"
+    done
+  } > "${CONFIG_FILE}"
 
-bashio::log.info "Config:"
-cat "${CONFIG_FILE}"
+  echo "[nest-rtsp] Config:"
+  cat "${CONFIG_FILE}"
 
-# Write cookies if provided via options
-cookies_json=$(bashio::config 'cookies_json')
-if [ -n "${cookies_json}" ] && [ "${cookies_json}" != "null" ]; then
-  echo "${cookies_json}" > "${COOKIES_FILE}"
-  bashio::log.info "Cookies written from add-on config"
+  # Write cookies from options
+  cookies_json=$(jq -r '.cookies_json // empty' "${OPTIONS}")
+  if [ -n "${cookies_json}" ]; then
+    echo "${cookies_json}" > "${COOKIES_FILE}"
+    echo "[nest-rtsp] Cookies written ($(echo "${cookies_json}" | wc -c) bytes)"
+  fi
+else
+  echo "[nest-rtsp] No options.json found, using existing config"
 fi
 
 if [ ! -f "${COOKIES_FILE}" ]; then
-  bashio::log.warning "No cookies file found — add cookies via Configuration tab"
+  echo "[nest-rtsp] WARNING: No cookies file — add cookies via Configuration tab"
 fi
 
-# Start nest-rtsp — pipe stderr to stdout so HA captures all logs
-bashio::log.info "Starting nest-rtsp binary..."
-exec nest-rtsp -config "${CONFIG_FILE}" 2>&1
+# Run the Go binary — stdout/stderr go directly to Docker logs
+echo "[nest-rtsp] Starting nest-rtsp binary..."
+exec nest-rtsp -config "${CONFIG_FILE}"

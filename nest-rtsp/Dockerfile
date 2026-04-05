@@ -1,4 +1,3 @@
-ARG BUILD_FROM=ghcr.io/hassio-addons/base:17.2.5
 FROM golang:1.25rc1-bookworm AS builder
 ENV GOTOOLCHAIN=auto
 
@@ -8,10 +7,12 @@ RUN go mod download
 COPY nest-rtsp-go/main.go .
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o nest-rtsp .
 
-FROM ${BUILD_FROM}
+FROM alpine:3.21
+
+RUN apk add --no-cache bash jq
 
 COPY --from=builder /build/nest-rtsp /usr/local/bin/nest-rtsp
+COPY run.sh /run.sh
+RUN chmod +x /run.sh
 
-RUN mkdir -p /etc/services.d/nest-rtsp
-COPY run.sh /etc/services.d/nest-rtsp/run
-RUN chmod +x /etc/services.d/nest-rtsp/run
+CMD ["/run.sh"]
