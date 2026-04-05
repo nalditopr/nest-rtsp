@@ -425,8 +425,20 @@ func connectCamera(cs *cameraStream, server *gortsplib.Server, cookies map[strin
 		return fmt.Errorf("timeout waiting for video track")
 	}
 
-	// Block until connection drops
-	err = <-done
+	// Proactive reconnect before Google kills us (~5.5min session limit)
+	// Reconnect at 4.5 minutes to avoid disruption
+	reconnectTimer := time.NewTimer(4*time.Minute + 30*time.Second)
+	defer reconnectTimer.Stop()
+
+	select {
+	case err = <-done:
+		// Connection dropped by Google or network error
+	case <-reconnectTimer.C:
+		// Proactive reconnect — prevents the 5.5min Google timeout
+		log.Printf("[%s] proactive reconnect (4m30s)", cs.name)
+		err = nil
+	}
+
 	cs.mu.Lock()
 	if cs.stream != nil {
 		cs.stream.Close()
