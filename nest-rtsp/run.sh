@@ -1,11 +1,10 @@
 #!/usr/bin/with-contenv bashio
-# nest-rtsp Home Assistant add-on entrypoint
+# nest-rtsp Home Assistant add-on
 
 CONFIG_DIR="/data"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 COOKIES_FILE="${CONFIG_DIR}/cookies.json"
 
-# Read add-on options
 bashio::log.info "Starting Nest RTSP add-on..."
 
 # Build config.yaml from HA add-on options
@@ -14,7 +13,6 @@ bashio::log.info "Starting Nest RTSP add-on..."
   echo "rtsp_port: 8554"
   echo "cameras:"
 
-  # Parse cameras from add-on config
   for camera in $(bashio::config 'cameras|keys'); do
     name=$(bashio::config "cameras[${camera}].name")
     device_id=$(bashio::config "cameras[${camera}].device_id")
@@ -35,13 +33,10 @@ if [ -n "${cookies_json}" ] && [ "${cookies_json}" != "null" ]; then
   bashio::log.info "Cookies written from add-on config"
 fi
 
-# Check if cookies exist
 if [ ! -f "${COOKIES_FILE}" ]; then
-  bashio::log.warning "No cookies file found at ${COOKIES_FILE}"
-  bashio::log.warning "Add cookies via the add-on configuration or paste them into ${COOKIES_FILE}"
-  bashio::log.warning "See: https://github.com/nalditopr/nest-rtsp#cookie-setup"
+  bashio::log.warning "No cookies file found — add cookies via Configuration tab"
 fi
 
-# Start nest-rtsp
-bashio::log.info "Starting nest-rtsp..."
-exec nest-rtsp -config "${CONFIG_FILE}"
+# Start nest-rtsp — pipe stderr to stdout so HA captures all logs
+bashio::log.info "Starting nest-rtsp binary..."
+exec nest-rtsp -config "${CONFIG_FILE}" 2>&1
