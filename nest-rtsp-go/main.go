@@ -140,7 +140,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("RTSP server: %v", err)
 	}
-	log.Printf("RTSP server on :%d", config.RTSPPort)
+	log.Printf("nest-rtsp started — %d cameras, RTSP on :%d", len(config.Cameras), config.RTSPPort)
 
 	// Start each camera
 	for name, cam := range config.Cameras {
@@ -281,7 +281,24 @@ func connectCamera(cs *cameraStream, server *gortsplib.Server, cookies map[strin
 			// Send PLI
 			pc.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: uint32(track.SSRC())}})
 
-			// Forward RTP packets directly to RTSP stream
+			// Forward RTP packets and log stats
+			var packets, bytes uint64
+			var firstPkt time.Time
+			statsTimer := time.NewTicker(10 * time.Second)
+			defer statsTimer.Stop()
+
+			// Log resolution from first SPS NAL unit
+			go func() {
+				for range statsTimer.C {
+					elapsed := time.Since(firstPkt).Seconds()
+					if elapsed > 0 && packets > 0 {
+						fps := float64(packets) / elapsed
+						mbps := float64(bytes) * 8 / elapsed / 1e6
+						log.Printf("[%s] %s %.0ffps %.2fMbps (%d pkts)", cs.name, codec.MimeType, fps, mbps, packets)
+					}
+				}
+			}()
+
 			for {
 				pkt, _, err := track.ReadRTP()
 				if err != nil {
@@ -291,6 +308,17 @@ func connectCamera(cs *cameraStream, server *gortsplib.Server, cookies map[strin
 				if len(pkt.Payload) < 2 {
 					continue
 				}
+
+				if firstPkt.IsZero() {
+					firstPkt = time.Now()
+					// Parse H.264 SPS for resolution
+					nalType := pkt.Payload[0] & 0x1f
+					if nalType == 7 { // SPS
+						log.Printf("[%s] got SPS, resolution will appear in stats", cs.name)
+					}
+				}
+				packets++
+				bytes += uint64(len(pkt.Payload))
 
 				cs.mu.RLock()
 				s := cs.stream
@@ -352,18 +380,32 @@ func connectCamera(cs *cameraStream, server *gortsplib.Server, cookies map[strin
 	var answer struct{ SDP string `json:"sdp"` }
 	json.Unmarshal(body, &answer)
 
+	// Log what Foyer offered
+	var answerCodecs []string
+	for _, line := range strings.Split(answer.SDP, "\n") {
+		if strings.Contains(line, "rtpmap") && !strings.Contains(line, "rtx") &&
+			!strings.Contains(line, "red") && !strings.Contains(line, "ulpfec") {
+			answerCodecs = append(answerCodecs, strings.TrimSpace(line))
+		}
+	}
+	hasTWCC := strings.Contains(answer.SDP, "transport-wide-cc")
+	log.Printf("[%s] foyer answered: %d codecs, twcc=%v", cs.name, len(answerCodecs), hasTWCC)
+	for _, c := range answerCodecs {
+		log.Printf("[%s]   %s", cs.name, c)
+	}
+
 	err = pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: answer.SDP})
 	if err != nil {
 		pc.Close()
 		return fmt.Errorf("SetRemoteDescription: %w", err)
 	}
 
-	log.Printf("[%s] connected, waiting for video...", cs.name)
+	log.Printf("[%s] negotiated, waiting for video...", cs.name)
 
 	// Wait for either track ready or failure
 	select {
 	case <-trackReady:
-		log.Printf("[%s] streaming (30fps)", cs.name)
+		log.Printf("[%s] streaming → rtsp://localhost%s/%s", cs.name, server.RTSPAddress, cs.name)
 	case err := <-done:
 		pc.Close()
 		return err
