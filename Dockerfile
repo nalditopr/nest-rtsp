@@ -21,10 +21,10 @@ COPY mediamtx.yml .
 COPY config.example.yaml .
 
 # Download MediaMTX
-RUN apt-get update && apt-get install -y --no-install-recommends wget && \
+RUN apt-get update && apt-get install -y --no-install-recommends wget ca-certificates && \
     wget -q https://github.com/bluenviron/mediamtx/releases/download/v1.9.3/mediamtx_v1.9.3_linux_amd64.tar.gz -O /tmp/mediamtx.tar.gz && \
-    tar -xzf /tmp/mediamtx.tar.gz -C /usr/local/bin mediamtx && \
-    rm /tmp/mediamtx.tar.gz && \
+    cd /tmp && tar -xzf mediamtx.tar.gz && cp mediamtx /usr/local/bin/ && \
+    rm -rf /tmp/mediamtx* && \
     apt-get remove -y wget && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 
 VOLUME /data
