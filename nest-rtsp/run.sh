@@ -10,9 +10,10 @@ echo "[nest-rtsp] Starting..."
 
 # Parse HA add-on options.json into our config format
 if [ -f "${OPTIONS}" ]; then
+  rtsp_port=$(jq -r '.rtsp_port // 8555' "${OPTIONS}")
   {
     echo "cookies_file: ${COOKIES_FILE}"
-    echo "rtsp_port: 8554"
+    echo "rtsp_port: ${rtsp_port}"
     echo "cameras:"
 
     # Parse cameras array from options.json
