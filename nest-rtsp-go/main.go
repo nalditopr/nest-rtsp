@@ -133,8 +133,8 @@ func main() {
 	handler.server = &gortsplib.Server{
 		Handler:        handler,
 		RTSPAddress:    fmt.Sprintf(":%d", config.RTSPPort),
-		UDPRTPAddress:  ":8000",
-		UDPRTCPAddress: ":8001",
+		UDPRTPAddress:  ":28000",
+		UDPRTCPAddress: ":28001",
 	}
 	err = handler.server.Start()
 	if err != nil {

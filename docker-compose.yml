@@ -3,6 +3,9 @@ services:
     build: .
     container_name: nest-rtsp
     restart: unless-stopped
-    network_mode: host
+    ports:
+      - "8554:8554"
+      - "28000:28000/udp"
+      - "28001:28001/udp"
     volumes:
       - ./data:/data

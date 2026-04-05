@@ -1,4 +1,5 @@
-FROM golang:1.24-bookworm AS builder
+FROM golang:1.25rc1-bookworm AS builder
+ENV GOTOOLCHAIN=auto
 WORKDIR /build
 COPY nest-rtsp-go/go.mod nest-rtsp-go/go.sum ./
 RUN go mod download
