@@ -11,7 +11,5 @@ RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o nest-rtsp .
 FROM ${BUILD_FROM}
 
 COPY --from=builder /build/nest-rtsp /usr/local/bin/nest-rtsp
-COPY run.sh /run.sh
-RUN chmod +x /run.sh
-
-CMD ["/run.sh"]
+COPY run.sh /etc/services.d/nest-rtsp/run
+RUN chmod +x /etc/services.d/nest-rtsp/run
