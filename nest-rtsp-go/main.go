@@ -143,6 +143,8 @@ func main() {
 	log.Printf("nest-rtsp started — %d cameras, RTSP on :%d", len(config.Cameras), config.RTSPPort)
 
 	// Start each camera
+	cameraIdx := 0
+	totalCams := len(config.Cameras)
 	for name, cam := range config.Cameras {
 		if cam.DeviceID == "" {
 			continue
@@ -152,7 +154,10 @@ func main() {
 		handler.cameras[name] = cs
 		handler.mu.Unlock()
 
-		go startCamera(cs, handler.server, cookies, config.APIKey)
+		// Stagger first reconnect so cameras don't all handoff at the same time
+		stagger := time.Duration(cameraIdx) * 5 * time.Minute / time.Duration(totalCams)
+		go startCamera(cs, handler.server, cookies, config.APIKey, stagger)
+		cameraIdx++
 		time.Sleep(500 * time.Millisecond)
 	}
 
@@ -164,10 +169,13 @@ func main() {
 	handler.server.Close()
 }
 
-func startCamera(cs *cameraStream, server *gortsplib.Server, cookies map[string]string, apiKey string) {
+func startCamera(cs *cameraStream, server *gortsplib.Server, cookies map[string]string, apiKey string, initialStagger time.Duration) {
 	failures := 0
+	reconnectInterval := 5 * time.Minute
+	firstRun := true
+
 	for {
-		err := connectCamera(cs, server, cookies, apiKey)
+		pc, done, err := connectCamera(cs, server, cookies, apiKey)
 		if err != nil {
 			failures++
 			delay := min(2*time.Second*time.Duration(1<<min(failures-1, 7)), 5*time.Minute)
@@ -176,10 +184,42 @@ func startCamera(cs *cameraStream, server *gortsplib.Server, cookies map[string]
 			continue
 		}
 		failures = 0
+
+		// First run: use stagger so cameras don't all reconnect at once
+		waitTime := reconnectInterval
+		if firstRun && initialStagger > 0 && initialStagger < reconnectInterval {
+			waitTime = initialStagger
+			firstRun = false
+		}
+
+		// Google kills sessions after ~5m55s. At 5 minutes, do make-before-break.
+		select {
+		case err = <-done:
+			log.Printf("[%s] connection dropped: %v", cs.name, err)
+			pc.Close()
+		case <-time.After(waitTime):
+			// Make-before-break: start new connection while old is still streaming
+			log.Printf("[%s] seamless reconnect", cs.name)
+			newPc, _, err := connectCamera(cs, server, cookies, apiKey)
+			if err != nil {
+				log.Printf("[%s] seamless reconnect failed: %v", cs.name, err)
+				// Old connection will die on its own soon
+				<-done
+				pc.Close()
+				continue
+			}
+			// New connection is live and writing to the RTSP stream.
+			// Close old connection — RTSP clients see no gap.
+			pc.Close()
+			log.Printf("[%s] seamless handoff done", cs.name)
+			// New connection now owns the stream. Wait for its cycle.
+			pc = newPc
+			continue
+		}
 	}
 }
 
-func connectCamera(cs *cameraStream, server *gortsplib.Server, cookies map[string]string, apiKey string) error {
+func connectCamera(cs *cameraStream, server *gortsplib.Server, cookies map[string]string, apiKey string) (*webrtc.PeerConnection, chan error, error) {
 	log.Printf("[%s] connecting to %s", cs.name, cs.config.DeviceID)
 
 	// Auth
@@ -229,7 +269,7 @@ func connectCamera(cs *cameraStream, server *gortsplib.Server, cookies map[strin
 		ICEServers: []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}},
 	})
 	if err != nil {
-		return fmt.Errorf("PeerConnection: %w", err)
+		return nil, nil, fmt.Errorf("PeerConnection: %w", err)
 	}
 	cs.pc = pc
 
@@ -378,14 +418,14 @@ func connectCamera(cs *cameraStream, server *gortsplib.Server, cookies map[strin
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		pc.Close()
-		return fmt.Errorf("Foyer API: %w", err)
+		return nil, nil, fmt.Errorf("Foyer API: %w", err)
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 
 	if resp.StatusCode != 200 {
 		pc.Close()
-		return fmt.Errorf("Foyer %d: %s", resp.StatusCode, string(body[:min(len(body), 100)]))
+		return nil, nil, fmt.Errorf("Foyer %d: %s", resp.StatusCode, string(body[:min(len(body), 100)]))
 	}
 
 	var answer struct{ SDP string `json:"sdp"` }
@@ -408,7 +448,7 @@ func connectCamera(cs *cameraStream, server *gortsplib.Server, cookies map[strin
 	err = pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: answer.SDP})
 	if err != nil {
 		pc.Close()
-		return fmt.Errorf("SetRemoteDescription: %w", err)
+		return nil, nil, fmt.Errorf("SetRemoteDescription: %w", err)
 	}
 
 	log.Printf("[%s] negotiated, waiting for video...", cs.name)
@@ -419,43 +459,15 @@ func connectCamera(cs *cameraStream, server *gortsplib.Server, cookies map[strin
 		log.Printf("[%s] streaming → rtsp://localhost%s/%s", cs.name, server.RTSPAddress, cs.name)
 	case err := <-done:
 		pc.Close()
-		return err
+		return nil, nil, err
 	case <-time.After(15 * time.Second):
 		pc.Close()
-		return fmt.Errorf("timeout waiting for video track")
+		return nil, nil, fmt.Errorf("timeout waiting for video track")
 	}
 
-	// Keepalive: send PLI every 30 seconds to keep the session alive
-	// (Chrome browser keeps sessions open for days — the 5.5min timeout
-	// was likely caused by lack of RTCP feedback after initial connection)
-	keepaliveTicker := time.NewTicker(30 * time.Second)
-	defer keepaliveTicker.Stop()
-
-	go func() {
-		for range keepaliveTicker.C {
-			videoReceiver := pc.GetReceivers()
-			for _, r := range videoReceiver {
-				if r.Track() != nil && r.Track().Kind() == webrtc.RTPCodecTypeVideo {
-					pc.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{
-						MediaSSRC: uint32(r.Track().SSRC()),
-					}})
-				}
-			}
-		}
-	}()
-
-	// Block until connection drops — no proactive reconnect
-	// Keepalive PLI should prevent Google from killing the session
-	err = <-done
-
-	cs.mu.Lock()
-	if cs.stream != nil {
-		cs.stream.Close()
-		cs.stream = nil
-	}
-	cs.mu.Unlock()
-	pc.Close()
-	return err
+	// Return the PeerConnection and done channel — caller manages lifecycle
+	// for make-before-break seamless reconnection
+	return pc, done, nil
 }
 
 func uint16Ptr(v uint16) *uint16 { return &v }

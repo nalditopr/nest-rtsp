@@ -1,6 +1,6 @@
 name: "Nest RTSP"
 description: "Direct 1080p 30fps RTSP from Google Nest cameras — no Chrome, no cloud relay"
-version: "1.0.8"
+version: "1.0.9"
 slug: nest-rtsp
 url: "https://github.com/nalditopr/nest-rtsp"
 init: false
