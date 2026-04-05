@@ -1,95 +1,52 @@
 # nest-rtsp
 
-Direct RTSP streams from Google Nest cameras via the Foyer API.
+Direct 1080p 30fps RTSP streams from Google Nest cameras. Single 11MB binary.
 
-**30fps 1080p H.264** with zero transcoding — just WebRTC to RTSP passthrough.
+No Chrome. No ffmpeg. No transcoding. No GPU needed.
 
 ## How it works
 
 ```
-Google Foyer API (SAPISIDHASH auth)
-     ↓ WebRTC (H.264, 30fps, 1.2Mbps)
-  Pion (Go WebRTC library)
-     ↓ RTP/UDP
-  ffmpeg -c:v copy (passthrough)
-     ↓ RTSP/TCP
-  MediaMTX
-     ↓ RTSP
-  Your NVR (Frigate, etc.)
+Google Foyer API
+  ↓ WebRTC H.264 (30fps, 1.2Mbps)
+nest-rtsp (Pion + gortsplib)
+  ↓ built-in RTSP server
+Your NVR (Frigate, etc.)
 ```
 
-No Chrome needed at runtime. No GPU needed. No transcoding.
+One process handles all cameras. WebRTC packets are forwarded directly to RTSP clients — zero decode, zero encode, zero copy beyond what the kernel requires.
 
 ## Quick start
 
-### 1. Configure cameras
-
 ```bash
-cp config.example.yaml config.yaml
-```
+# 1. Copy and edit config
+cp config.example.yaml data/config.yaml
 
-Edit `config.yaml` with your camera device IDs (see [Finding device IDs](#finding-device-ids)).
+# 2. Add your cookies (see Cookie Setup below)
 
-### 2. Set up cookies
-
-You need Google session cookies from a logged-in browser. See [Cookie setup](#cookie-setup).
-
-### 3. Run with Docker
-
-```bash
+# 3. Run
 docker compose up -d
+# or: ./nest-rtsp -config data/config.yaml
+
+# Streams at rtsp://localhost:8554/{camera_name}
 ```
 
-Streams available at `rtsp://localhost:8554/{camera_name}`.
+## Resource usage
 
-### 4. Connect your NVR
+Per camera: **~1.5% CPU, 5MB RAM.** 8 cameras total: **11% CPU, 41MB RAM.**
 
-Example Frigate config:
-
-```yaml
-cameras:
-  front_door:
-    ffmpeg:
-      inputs:
-        - path: rtsp://nest-rtsp:8554/front_door
-          input_args: preset-rtsp-restream
-          roles: [detect, record]
-    detect:
-      width: 1920
-      height: 1080
-```
+No GPU required. Runs on a Raspberry Pi.
 
 ## Cookie setup
 
-nest-rtsp needs Google session cookies to authenticate with the Foyer API. Cookies expire every few weeks and need refreshing.
+nest-rtsp authenticates with Google using browser session cookies. You need to extract them once, and refresh every few weeks when they expire.
 
-### Option A: Bookmarklet (easiest)
+### Extract cookies
 
-1. Start nest-rtsp: `docker compose up -d`
-2. Open `http://localhost:3000` in your browser
-3. Drag the **"Send Cookies"** bookmarklet to your bookmarks bar
-4. Go to [home.google.com](https://home.google.com) and log in
-5. Click the bookmarklet — you should see "ok (valid)"
-
-**Limitation:** The bookmarklet can only access non-httpOnly cookies. It works for auth but some cookies are missed.
-
-### Option B: Persistent Chrome profile (recommended)
-
-This method stores a full Chrome profile so cookies auto-refresh:
-
-```bash
-# First time — log in interactively
-docker exec -it nest-rtsp npx playwright open \
-  --user-data-dir=/data/chrome-profile \
-  https://home.google.com
-
-# Log in with your Google account, then close the browser.
-# nest-rtsp will auto-extract cookies every 6 hours.
-```
-
-### Option C: Manual cookie file
-
-Extract cookies from your browser and save as `data/cookies.json`:
+1. Open Chrome and go to [home.google.com](https://home.google.com)
+2. Log in if needed
+3. Open DevTools (F12) → Application → Cookies → `https://home.google.com`
+4. Create `data/cookies.json` with these cookie values:
 
 ```json
 {
@@ -103,146 +60,107 @@ Extract cookies from your browser and save as `data/cookies.json`:
   "__Secure-1PAPISID": "...",
   "__Secure-3PAPISID": "...",
   "NID": "...",
-  "SIDCC": "..."
+  "SIDCC": "...",
+  "__Secure-1PSIDTS": "...",
+  "__Secure-3PSIDTS": "...",
+  "__Secure-1PSIDCC": "...",
+  "__Secure-3PSIDCC": "..."
 }
 ```
 
-To extract from Chrome:
-1. Go to [home.google.com](https://home.google.com)
-2. Open DevTools → Application → Cookies → `.google.com`
-3. Copy each cookie name/value pair
+### Automated extraction (optional)
+
+If you have Playwright installed:
+
+```bash
+npx playwright open --user-data-dir=data/chrome-profile https://home.google.com
+# Log in, then Ctrl+C. Extract cookies with:
+node -e "
+const { chromium } = require('playwright');
+(async () => {
+  const ctx = await chromium.launchPersistentContext('data/chrome-profile', {headless:true});
+  const page = await ctx.newPage();
+  await page.goto('https://home.google.com');
+  const cookies = await ctx.cookies('https://home.google.com');
+  const kv = {};
+  cookies.filter(c => c.domain === '.google.com').forEach(c => kv[c.name] = c.value);
+  require('fs').writeFileSync('data/cookies.json', JSON.stringify(kv, null, 2));
+  console.log('Saved', Object.keys(kv).length, 'cookies');
+  await ctx.close();
+})();
+"
+```
 
 ## Finding device IDs
-
-Device IDs look like `DEVICE_C74582B7127A396C`. To find yours:
 
 1. Go to [home.google.com](https://home.google.com) in Chrome
 2. Open DevTools → Network tab
 3. Click on a camera to start its live view
 4. Look for a request to `join_stream`
-5. In the request body, find the `deviceId` field
-
-Alternatively, check the Foyer API response at `http://localhost:3000/health` after setting up cookies.
+5. The `deviceId` field in the request body is what you need (e.g., `DEVICE_C74582B7127A396C`)
 
 ## Configuration
 
-### config.yaml
+`data/config.yaml`:
 
 ```yaml
 cookies_file: /data/cookies.json
-chrome_profile: /data/chrome-profile
-cookie_refresh_hours: 6
 rtsp_port: 8554
-cookie_server_port: 3000
-stream_mode: pion          # 'pion' (30fps) or 'direct' (10fps fallback)
-api_key: AIzaSyCMqap8NH88PrhvoBwY1W8ChRUJRjIOJXM
 
 cameras:
   front_door:
     device_id: DEVICE_XXXXXXXXXXXXXXXX
-    resolution: 3          # 0=low, 1=SD, 2=HD, 3=Full (1080p)
+    resolution: 3    # 0=low, 1=SD, 2=HD, 3=Full (1080p)
   backyard:
     device_id: DEVICE_YYYYYYYYYYYYYYYY
     resolution: 3
 ```
 
-### Environment variables
+## Frigate integration
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `STREAM_MODE` | `pion` | `pion` (30fps) or `direct` (10fps) |
-| `COOKIES_FILE` | `/data/cookies.json` | Path to cookies |
-| `CHROME_PROFILE` | `/data/chrome-profile` | Chrome profile dir |
-| `COOKIE_REFRESH_HOURS` | `6` | Auto-refresh interval |
-| `RTSP_PORT` | `8554` | RTSP output port |
-| `COOKIE_SERVER_PORT` | `3000` | Cookie UI port |
-| `CAMERAS` | (from config) | Inline: `name:DEVICE_ID:res,...` |
+```yaml
+cameras:
+  front_door:
+    ffmpeg:
+      inputs:
+        - path: rtsp://localhost:8554/front_door
+          roles: [detect, record]
+    detect:
+      width: 1920
+      height: 1080
+```
 
-## Stream modes
+## Logs
 
-### Pion (default, recommended)
+nest-rtsp logs codec, fps, bitrate, and frame count every 10 seconds:
 
-Uses a Go binary ([Pion WebRTC](https://github.com/pion/webrtc)) that generates Chrome-like SDP offers with proper bandwidth estimation (transport-wide-cc). Google's server sends full quality: **30fps, 1.2Mbps, 1080p H.264**.
+```
+[front_door] video/H264 — 30.0fps 1.14Mbps (600 frames, 2740 pkts)
+[backyard]   video/H264 — 30.1fps 1.07Mbps (601 frames, 2511 pkts)
+[garage]     video/H264 — 14.7fps 0.53Mbps (295 frames, 1210 pkts)
+```
 
-### Direct (fallback)
-
-Uses [werift](https://github.com/nicklason/werift) (Node.js WebRTC). Simpler but Google throttles to **10fps, 0.06Mbps** because werift's SDP doesn't include the header extensions needed for bandwidth estimation.
-
-## Running without Docker
+## Building
 
 ```bash
-# Install dependencies
-npm install
-cd pion-bridge && go build -o pion-bridge . && cd ..
+cd nest-rtsp-go
+go build -ldflags="-s -w" -o nest-rtsp .
+```
 
-# Download MediaMTX
-wget https://github.com/bluenviron/mediamtx/releases/download/v1.9.3/mediamtx_v1.9.3_linux_amd64.tar.gz
-tar xzf mediamtx_v1.9.3_linux_amd64.tar.gz
+Or with Docker:
 
-# Set up cookies (see above)
-mkdir -p data
-# ... copy cookies.json to data/
-
-# Run MediaMTX
-./mediamtx mediamtx.yml &
-
-# Run nest-rtsp
-cp config.example.yaml config.yaml
-# ... edit config.yaml ...
-node src/index.js
+```bash
+docker build -t nest-rtsp .
 ```
 
 ## Architecture
 
-```
-┌─────────────┐
-│ config.yaml │ Camera device IDs + settings
-└──────┬──────┘
-       │
-┌──────▼──────┐     ┌──────────────┐
-│  nest-rtsp  │────▶│ pion-bridge  │ (one per camera)
-│  (Node.js)  │     │    (Go)      │
-└──────┬──────┘     └──────┬───────┘
-       │                   │ WebRTC (H.264, 30fps)
-       │                   ▼
-       │            Google Foyer API
-       │                   │
-       │            ┌──────▼───────┐
-       │            │  UDP RTP     │
-       │            └──────┬───────┘
-       │                   │
-┌──────▼──────┐     ┌──────▼───────┐
-│   ffmpeg    │◀────│ SDP file     │
-│  -c:v copy  │     └──────────────┘
-└──────┬──────┘
-       │ RTSP/TCP
-┌──────▼──────┐
-│  MediaMTX   │ :8554
-└──────┬──────┘
-       │ RTSP
-┌──────▼──────┐
-│  Frigate /  │
-│  Your NVR   │
-└─────────────┘
-```
+Single Go binary using:
+- [Pion WebRTC](https://github.com/pion/webrtc) — WebRTC with Chrome-like SDP for full 30fps from Google
+- [gortsplib](https://github.com/bluenviron/gortsplib) — Built-in RTSP server, no external dependencies
+- SAPISIDHASH authentication — same auth as the Google Home web app
 
-## Resource usage
-
-Measured with 8 Nest cameras at 1080p/30fps:
-
-| Component | Per camera | 8 cameras |
-|-----------|-----------|-----------|
-| pion-bridge (Go) | 1.5% CPU, 18MB RAM | 12% CPU, 140MB RAM |
-| ffmpeg (passthrough) | 1.5% CPU, 53MB RAM | 12% CPU, 424MB RAM |
-| Node.js orchestrator | — | 0.1% CPU, 91MB RAM |
-| MediaMTX | — | 0.9% CPU, 30MB RAM |
-| **Total** | **~3% CPU, 71MB** | **~24% CPU, 685MB RAM** |
-
-**No GPU required.** The H.264 stream is passed through without decoding or encoding. ffmpeg only muxes RTP to RTSP.
-
-**Minimum hardware:** Any x86_64 Linux system with 1GB RAM and a network connection. Runs on a Raspberry Pi 4 (ARM64) if you cross-compile the Go binary. A $5/month VPS can handle 8 cameras.
-
-**Network:** Each camera uses ~1.2 Mbps downstream from Google + ~1.2 Mbps to your NVR on the local network.
+The key to getting 30fps (vs 10fps with naive WebRTC): registering all 11 Chrome header extensions including `transport-wide-cc` for bandwidth estimation. Without these, Google's server throttles to minimum quality.
 
 ## License
 

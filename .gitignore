@@ -1,6 +1,8 @@
 node_modules/
 data/
 *.log
+*.exe
 pion-bridge/pion-bridge
 pion-test/
+nest-rtsp-go/nest-rtsp
 .env

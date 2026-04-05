@@ -6,6 +6,3 @@ services:
     network_mode: host
     volumes:
       - ./data:/data
-      - ./config.yaml:/app/config.yaml:ro
-    environment:
-      - STREAM_MODE=pion

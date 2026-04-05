@@ -1,8 +1,0 @@
-rtspAddress: :8554
-rtpAddress: :8000
-rtcpAddress: :8001
-api: yes
-apiAddress: :9997
-
-paths:
-  all_others:
