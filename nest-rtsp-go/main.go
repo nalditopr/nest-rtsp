@@ -105,6 +105,50 @@ func getNALType(payload []byte) byte {
 	return typ
 }
 
+// extractSPSPPS pulls SPS and PPS NAL units from RTP packets.
+// Handles single NAL (type 7/8), STAP-A (type 24 containing multiple NALs),
+// and FU-A (type 28 fragmented NALs).
+func extractSPSPPS(packets []*pionrtp.Packet) (sps, pps []byte) {
+	for _, pkt := range packets {
+		if len(pkt.Payload) < 2 {
+			continue
+		}
+		typ := pkt.Payload[0] & 0x1F
+
+		switch {
+		case typ == 7: // Single SPS NAL
+			sps = make([]byte, len(pkt.Payload))
+			copy(sps, pkt.Payload)
+		case typ == 8: // Single PPS NAL
+			pps = make([]byte, len(pkt.Payload))
+			copy(pps, pkt.Payload)
+		case typ == 24: // STAP-A — aggregation of multiple NAL units
+			// Format: [STAP-A header(1)] [size(2) NAL(N)] [size(2) NAL(N)] ...
+			offset := 1
+			for offset+2 < len(pkt.Payload) {
+				nalSize := int(pkt.Payload[offset])<<8 | int(pkt.Payload[offset+1])
+				offset += 2
+				if offset+nalSize > len(pkt.Payload) {
+					break
+				}
+				nalData := pkt.Payload[offset : offset+nalSize]
+				if len(nalData) > 0 {
+					nalType := nalData[0] & 0x1F
+					if nalType == 7 && sps == nil {
+						sps = make([]byte, nalSize)
+						copy(sps, nalData)
+					} else if nalType == 8 && pps == nil {
+						pps = make([]byte, nalSize)
+						copy(pps, nalData)
+					}
+				}
+				offset += nalSize
+			}
+		}
+	}
+	return
+}
+
 func main() {
 	configPath := flag.String("config", "config.yaml", "Path to config file")
 	flag.Parse()
@@ -205,12 +249,16 @@ func startCamera(cs *cameraStream, server *gortsplib.Server, cookies map[string]
 			continue
 		}
 
-		// Create RTSP stream once
+		// Create RTSP stream once — with SPS/PPS for proper DESCRIBE
 		cs.mu.Lock()
 		if cs.stream == nil {
+			sps, pps := extractSPSPPS(idrPkts)
+			log.Printf("[%s] extracted SPS=%d PPS=%d from %d IDR packets", cs.name, len(sps), len(pps), len(idrPkts))
 			forma := &format.H264{
 				PayloadTyp:        96,
 				PacketizationMode: 1,
+				SPS:               sps,
+				PPS:               pps,
 			}
 			media := &description.Media{Type: description.MediaTypeVideo, Formats: []format.Format{forma}}
 			cs.media = media
