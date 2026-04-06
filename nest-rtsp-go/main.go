@@ -197,10 +197,34 @@ func startCamera(cs *cameraStream, server *gortsplib.Server, cookies map[string]
 		}
 		failures = 0
 
-		// Create RTSP stream once — never close it
+		// Wait for first IDR with SPS/PPS before creating/starting the stream
+		idrPkts := waitForIDR(conn.pkts, 15*time.Second)
+		if idrPkts == nil {
+			log.Printf("[%s] no IDR received — retrying", cs.name)
+			conn.pc.Close()
+			continue
+		}
+
+		// Create RTSP stream once with SPS/PPS from the actual stream
 		cs.mu.Lock()
 		if cs.stream == nil {
-			forma := &format.H264{PayloadTyp: 96, PacketizationMode: 1}
+			// Extract SPS and PPS from buffered packets
+			var sps, pps []byte
+			for _, pkt := range idrPkts {
+				nt := getNALType(pkt.Payload)
+				if nt == 7 && sps == nil {
+					// For single NAL unit, payload IS the NAL
+					sps = pkt.Payload
+				} else if nt == 8 && pps == nil {
+					pps = pkt.Payload
+				}
+			}
+			forma := &format.H264{
+				PayloadTyp:        96,
+				PacketizationMode: 1,
+				SPS:               sps,
+				PPS:               pps,
+			}
 			media := &description.Media{Type: description.MediaTypeVideo, Formats: []format.Format{forma}}
 			cs.media = media
 			stream := &gortsplib.ServerStream{Server: server, Desc: &description.Session{Medias: []*description.Media{media}}}
@@ -211,13 +235,25 @@ func startCamera(cs *cameraStream, server *gortsplib.Server, cookies map[string]
 				continue
 			}
 			cs.stream = stream
-			log.Printf("[%s] RTSP stream created", cs.name)
+			log.Printf("[%s] RTSP stream created (SPS=%d PPS=%d)", cs.name, len(sps), len(pps))
 		}
 		cs.mu.Unlock()
 
-		// Become the active writer (increment generation)
+		// Become the active writer
 		myGen := cs.gen.Add(1)
 		log.Printf("[%s] streaming (gen %d)", cs.name, myGen)
+
+		// Write the buffered IDR packets first
+		cs.mu.RLock()
+		s := cs.stream
+		m := cs.media
+		cs.mu.RUnlock()
+		for _, pkt := range idrPkts {
+			func() {
+				defer func() { recover() }()
+				s.WritePacketRTP(m, pkt)
+			}()
+		}
 
 		// Forward packets from this connection to RTSP stream
 		// Stop if: connection dies OR we're no longer the active writer
