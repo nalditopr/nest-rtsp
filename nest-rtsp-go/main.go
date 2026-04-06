@@ -205,25 +205,12 @@ func startCamera(cs *cameraStream, server *gortsplib.Server, cookies map[string]
 			continue
 		}
 
-		// Create RTSP stream once with SPS/PPS from the actual stream
+		// Create RTSP stream once
 		cs.mu.Lock()
 		if cs.stream == nil {
-			// Extract SPS and PPS from buffered packets
-			var sps, pps []byte
-			for _, pkt := range idrPkts {
-				nt := getNALType(pkt.Payload)
-				if nt == 7 && sps == nil {
-					// For single NAL unit, payload IS the NAL
-					sps = pkt.Payload
-				} else if nt == 8 && pps == nil {
-					pps = pkt.Payload
-				}
-			}
 			forma := &format.H264{
 				PayloadTyp:        96,
 				PacketizationMode: 1,
-				SPS:               sps,
-				PPS:               pps,
 			}
 			media := &description.Media{Type: description.MediaTypeVideo, Formats: []format.Format{forma}}
 			cs.media = media
@@ -235,7 +222,7 @@ func startCamera(cs *cameraStream, server *gortsplib.Server, cookies map[string]
 				continue
 			}
 			cs.stream = stream
-			log.Printf("[%s] RTSP stream created (SPS=%d PPS=%d)", cs.name, len(sps), len(pps))
+			log.Printf("[%s] RTSP stream created", cs.name)
 		}
 		cs.mu.Unlock()
 
@@ -375,13 +362,13 @@ func forwardPackets(cs *cameraStream, conn *webrtcConn, myGen int64) {
 	}
 }
 
-// waitForIDR reads packets from the channel until it finds an IDR keyframe.
-// Returns all packets from the SPS/PPS through the complete IDR frame.
-// Returns nil on timeout.
+// waitForIDR reads packets from the channel until it finds a keyframe.
+// Looks for SPS (7), PPS (8), IDR (5), or STAP-A (24) containing SPS.
+// Returns buffered packets from the keyframe. Returns nil on timeout.
 func waitForIDR(pkts chan *pionrtp.Packet, timeout time.Duration) []*pionrtp.Packet {
 	deadline := time.After(timeout)
 	var buf []*pionrtp.Packet
-	gotSPS := false
+	collecting := false
 
 	for {
 		select {
@@ -389,19 +376,30 @@ func waitForIDR(pkts chan *pionrtp.Packet, timeout time.Duration) []*pionrtp.Pac
 			if !ok {
 				return nil
 			}
+			if len(pkt.Payload) < 2 {
+				continue
+			}
 			nalType := getNALType(pkt.Payload)
 
-			if nalType == 7 { // SPS
-				gotSPS = true
-				buf = buf[:0] // reset buffer, start collecting from SPS
+			// Start collecting at SPS, STAP-A, or IDR
+			if nalType == 7 || nalType == 24 || nalType == 5 {
+				if !collecting {
+					collecting = true
+					buf = buf[:0]
+				}
 			}
-			if gotSPS {
+			if collecting {
 				buf = append(buf, pkt)
 			}
-			if gotSPS && nalType == 5 { // IDR — we have SPS + PPS + IDR
+			// Return once we have an IDR (or enough packets after SPS)
+			if collecting && (nalType == 5 || (len(buf) > 3 && nalType != 7 && nalType != 8)) {
 				return buf
 			}
 		case <-deadline:
+			// Timeout — return whatever we have if we collected anything
+			if len(buf) > 0 {
+				return buf
+			}
 			return nil
 		}
 	}
