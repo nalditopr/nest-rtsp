@@ -45,13 +45,12 @@ type Config struct {
 
 // Camera stream state
 type cameraStream struct {
-	name     string
-	config   CameraConfig
-	pc       *webrtc.PeerConnection
-	media    *description.Media
-	stream   *gortsplib.ServerStream
-	writing  bool // false = pause writing (during handoff)
-	mu       sync.RWMutex
+	name   string
+	config CameraConfig
+	pc     *webrtc.PeerConnection
+	media  *description.Media
+	stream *gortsplib.ServerStream
+	mu     sync.RWMutex
 }
 
 // RTSP server handler — serves all camera streams
@@ -186,57 +185,31 @@ func startCamera(cs *cameraStream, server *gortsplib.Server, cookies map[string]
 		}
 		failures = 0
 
+		// First run: use stagger so cameras don't all reconnect at once
 		waitTime := reconnectInterval
 		if firstRun && initialStagger > 0 && initialStagger < reconnectInterval {
 			waitTime = initialStagger
 			firstRun = false
 		}
 
+		// Google kills sessions after ~5m55s.
+		// Proactive reconnect at 5 minutes — staggered so only one camera at a time.
+		// Brief ~3 second gap per camera, but no artifacts.
 		select {
 		case err = <-done:
-			// Connection died unexpectedly — keep stream alive for reconnect
 			log.Printf("[%s] connection dropped: %v", cs.name, err)
-			cs.mu.Lock()
-			cs.writing = false
-			cs.mu.Unlock()
-			pc.Close()
-
 		case <-time.After(waitTime):
-			// Seamless handoff:
-			// 1. Pause writing from old connection
-			// 2. Start new connection (it creates a new stream + waits for keyframe)
-			// 3. New connection takes over writing
-			// 4. Close old connection
-			log.Printf("[%s] seamless handoff starting", cs.name)
-
-			// Step 1: pause old writer
-			cs.mu.Lock()
-			cs.writing = false
-			cs.mu.Unlock()
-
-			// Step 2: new connection — creates new stream, waits for first keyframe
-			newPc, _, err := connectCamera(cs, server, cookies, apiKey)
-			if err != nil {
-				log.Printf("[%s] handoff failed: %v", cs.name, err)
-				// Resume old writer and let it die naturally
-				cs.mu.Lock()
-				cs.writing = true
-				cs.mu.Unlock()
-				<-done
-				cs.mu.Lock()
-				cs.writing = false
-				cs.mu.Unlock()
-				pc.Close()
-				continue
-			}
-
-			// Step 3+4: new connection is streaming. Close old.
-			oldPc := pc
-			go func() { oldPc.Close() }()
-			pc = newPc
-			log.Printf("[%s] seamless handoff done", cs.name)
-			continue
+			log.Printf("[%s] proactive reconnect (staggered)", cs.name)
 		}
+
+		// Clean close: tear down stream, close connection, reconnect fresh
+		cs.mu.Lock()
+		if cs.stream != nil {
+			cs.stream.Close()
+			cs.stream = nil
+		}
+		cs.mu.Unlock()
+		pc.Close()
 	}
 }
 
@@ -314,32 +287,28 @@ func connectCamera(cs *cameraStream, server *gortsplib.Server, cookies map[strin
 		log.Printf("[%s] track: %s codec=%s pt=%d", cs.name, track.Kind(), codec.MimeType, codec.PayloadType)
 
 		if track.Kind() == webrtc.RTPCodecTypeVideo {
-			// Create RTSP stream only on first connection — reuse for reconnects
-			cs.mu.Lock()
-			if cs.stream == nil {
-				forma := &format.H264{
-					PayloadTyp:        uint8(codec.PayloadType),
-					PacketizationMode: 1,
-				}
-				media := &description.Media{
-					Type:    description.MediaTypeVideo,
-					Formats: []format.Format{forma},
-				}
-				cs.media = media
-				stream := &gortsplib.ServerStream{
-					Server: server,
-					Desc:   &description.Session{Medias: []*description.Media{media}},
-				}
-				err := stream.Initialize()
-				if err != nil {
-					cs.mu.Unlock()
-					log.Printf("[%s] stream init error: %v", cs.name, err)
-					return
-				}
-				cs.stream = stream
-				log.Printf("[%s] RTSP stream created", cs.name)
+			// Create RTSP stream with H.264 format
+			forma := &format.H264{
+				PayloadTyp:        uint8(codec.PayloadType),
+				PacketizationMode: 1,
 			}
-			cs.writing = true
+			media := &description.Media{
+				Type:    description.MediaTypeVideo,
+				Formats: []format.Format{forma},
+			}
+			cs.mu.Lock()
+			cs.media = media
+			stream := &gortsplib.ServerStream{
+				Server: server,
+				Desc:   &description.Session{Medias: []*description.Media{media}},
+			}
+			err := stream.Initialize()
+			if err != nil {
+				cs.mu.Unlock()
+				log.Printf("[%s] stream init error: %v", cs.name, err)
+				return
+			}
+			cs.stream = stream
 			cs.mu.Unlock()
 
 			log.Printf("[%s] RTSP stream ready", cs.name)
@@ -396,10 +365,9 @@ func connectCamera(cs *cameraStream, server *gortsplib.Server, cookies map[strin
 				cs.mu.RLock()
 				s := cs.stream
 				m := cs.media
-				w := cs.writing
 				cs.mu.RUnlock()
 
-				if w && s != nil && m != nil {
+				if s != nil && m != nil {
 					func() {
 						defer func() { recover() }()
 						s.WritePacketRTP(m, pkt)
