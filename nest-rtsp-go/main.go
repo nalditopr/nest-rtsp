@@ -192,30 +192,24 @@ func startCamera(cs *cameraStream, server *gortsplib.Server, cookies map[string]
 			firstRun = false
 		}
 
-		// Google kills sessions after ~5m55s. At 5 minutes, do make-before-break.
+		// Google kills sessions after ~5m55s.
+		// Proactive reconnect at 5 minutes — staggered so only one camera at a time.
+		// Brief ~3 second gap per camera, but no artifacts.
 		select {
 		case err = <-done:
 			log.Printf("[%s] connection dropped: %v", cs.name, err)
-			pc.Close()
 		case <-time.After(waitTime):
-			// Make-before-break: start new connection while old is still streaming
-			log.Printf("[%s] seamless reconnect", cs.name)
-			newPc, _, err := connectCamera(cs, server, cookies, apiKey)
-			if err != nil {
-				log.Printf("[%s] seamless reconnect failed: %v", cs.name, err)
-				// Old connection will die on its own soon
-				<-done
-				pc.Close()
-				continue
-			}
-			// New connection is live and writing to the RTSP stream.
-			// Close old connection — RTSP clients see no gap.
-			pc.Close()
-			log.Printf("[%s] seamless handoff done", cs.name)
-			// New connection now owns the stream. Wait for its cycle.
-			pc = newPc
-			continue
+			log.Printf("[%s] proactive reconnect (staggered)", cs.name)
 		}
+
+		// Clean close: tear down stream, close connection, reconnect fresh
+		cs.mu.Lock()
+		if cs.stream != nil {
+			cs.stream.Close()
+			cs.stream = nil
+		}
+		cs.mu.Unlock()
+		pc.Close()
 	}
 }
 
