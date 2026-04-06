@@ -17,10 +17,12 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/pion/rtcp"
+	pionrtp "github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 	"gopkg.in/yaml.v3"
 
@@ -30,7 +32,6 @@ import (
 	"github.com/bluenviron/gortsplib/v5/pkg/format"
 )
 
-// Config
 type CameraConfig struct {
 	DeviceID   string `yaml:"device_id"`
 	Resolution int    `yaml:"resolution"`
@@ -43,17 +44,17 @@ type Config struct {
 	Cameras     map[string]CameraConfig `yaml:"cameras"`
 }
 
-// Camera stream state
+// activeWriter is atomically swapped to switch which WebRTC connection
+// feeds the RTSP stream. Only the holder of the current generation writes.
 type cameraStream struct {
 	name   string
 	config CameraConfig
-	pc     *webrtc.PeerConnection
 	media  *description.Media
 	stream *gortsplib.ServerStream
+	gen    atomic.Int64 // current writer generation
 	mu     sync.RWMutex
 }
 
-// RTSP server handler — serves all camera streams
 type rtspHandler struct {
 	cameras map[string]*cameraStream
 	server  *gortsplib.Server
@@ -67,12 +68,10 @@ func (h *rtspHandler) OnSessionOpen(_ *gortsplib.ServerHandlerOnSessionOpenCtx) 
 func (h *rtspHandler) OnSessionClose(_ *gortsplib.ServerHandlerOnSessionCloseCtx) {}
 
 func (h *rtspHandler) OnDescribe(ctx *gortsplib.ServerHandlerOnDescribeCtx) (*base.Response, *gortsplib.ServerStream, error) {
-	// Extract camera name from path (e.g., "/culdesac")
 	name := strings.TrimPrefix(ctx.Path, "/")
 	h.mu.RLock()
 	cam, ok := h.cameras[name]
 	h.mu.RUnlock()
-
 	if !ok || cam.stream == nil {
 		return &base.Response{StatusCode: base.StatusNotFound}, nil, nil
 	}
@@ -84,7 +83,6 @@ func (h *rtspHandler) OnSetup(ctx *gortsplib.ServerHandlerOnSetupCtx) (*base.Res
 	h.mu.RLock()
 	cam, ok := h.cameras[name]
 	h.mu.RUnlock()
-
 	if !ok || cam.stream == nil {
 		return &base.Response{StatusCode: base.StatusNotFound}, nil, nil
 	}
@@ -95,11 +93,22 @@ func (h *rtspHandler) OnPlay(_ *gortsplib.ServerHandlerOnPlayCtx) (*base.Respons
 	return &base.Response{StatusCode: base.StatusOK}, nil
 }
 
+// getNALType extracts the NAL unit type from an RTP H.264 payload
+func getNALType(payload []byte) byte {
+	if len(payload) < 2 {
+		return 0
+	}
+	typ := payload[0] & 0x1F
+	if typ == 28 { // FU-A: real type in second byte
+		return payload[1] & 0x1F
+	}
+	return typ
+}
+
 func main() {
 	configPath := flag.String("config", "config.yaml", "Path to config file")
 	flag.Parse()
 
-	// Load config
 	data, err := os.ReadFile(*configPath)
 	if err != nil {
 		log.Fatalf("Cannot read config: %v", err)
@@ -117,7 +126,6 @@ func main() {
 		config.CookiesFile = "data/cookies.json"
 	}
 
-	// Load cookies
 	cookieData, err := os.ReadFile(config.CookiesFile)
 	if err != nil {
 		log.Fatalf("Cannot read cookies: %v", err)
@@ -128,7 +136,6 @@ func main() {
 		log.Fatal("No SAPISID in cookies")
 	}
 
-	// Create RTSP server
 	handler := &rtspHandler{cameras: make(map[string]*cameraStream)}
 	handler.server = &gortsplib.Server{
 		Handler:        handler,
@@ -142,7 +149,6 @@ func main() {
 	}
 	log.Printf("nest-rtsp started — %d cameras, RTSP on :%d", len(config.Cameras), config.RTSPPort)
 
-	// Start each camera
 	cameraIdx := 0
 	totalCams := len(config.Cameras)
 	for name, cam := range config.Cameras {
@@ -154,14 +160,12 @@ func main() {
 		handler.cameras[name] = cs
 		handler.mu.Unlock()
 
-		// Stagger first reconnect so cameras don't all handoff at the same time
 		stagger := time.Duration(cameraIdx) * 5 * time.Minute / time.Duration(totalCams)
 		go startCamera(cs, handler.server, cookies, config.APIKey, stagger)
 		cameraIdx++
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	// Wait for signal
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
@@ -169,13 +173,21 @@ func main() {
 	handler.server.Close()
 }
 
+// webrtcConn holds a live WebRTC connection and its packet channel
+type webrtcConn struct {
+	pc   *webrtc.PeerConnection
+	pkts chan *pionrtp.Packet
+	done chan error
+}
+
 func startCamera(cs *cameraStream, server *gortsplib.Server, cookies map[string]string, apiKey string, initialStagger time.Duration) {
-	failures := 0
 	reconnectInterval := 5 * time.Minute
 	firstRun := true
+	failures := 0
 
 	for {
-		pc, done, err := connectCamera(cs, server, cookies, apiKey)
+		// Establish first/new WebRTC connection
+		conn, err := dialWebRTC(cs, cookies, apiKey)
 		if err != nil {
 			failures++
 			delay := min(2*time.Second*time.Duration(1<<min(failures-1, 7)), 5*time.Minute)
@@ -185,38 +197,185 @@ func startCamera(cs *cameraStream, server *gortsplib.Server, cookies map[string]
 		}
 		failures = 0
 
-		// First run: use stagger so cameras don't all reconnect at once
+		// Create RTSP stream once — never close it
+		cs.mu.Lock()
+		if cs.stream == nil {
+			forma := &format.H264{PayloadTyp: 96, PacketizationMode: 1}
+			media := &description.Media{Type: description.MediaTypeVideo, Formats: []format.Format{forma}}
+			cs.media = media
+			stream := &gortsplib.ServerStream{Server: server, Desc: &description.Session{Medias: []*description.Media{media}}}
+			if err := stream.Initialize(); err != nil {
+				cs.mu.Unlock()
+				log.Printf("[%s] stream init error: %v", cs.name, err)
+				conn.pc.Close()
+				continue
+			}
+			cs.stream = stream
+			log.Printf("[%s] RTSP stream created", cs.name)
+		}
+		cs.mu.Unlock()
+
+		// Become the active writer (increment generation)
+		myGen := cs.gen.Add(1)
+		log.Printf("[%s] streaming (gen %d)", cs.name, myGen)
+
+		// Forward packets from this connection to RTSP stream
+		// Stop if: connection dies OR we're no longer the active writer
+		go forwardPackets(cs, conn, myGen)
+
+		// Decide when to reconnect
 		waitTime := reconnectInterval
 		if firstRun && initialStagger > 0 && initialStagger < reconnectInterval {
 			waitTime = initialStagger
 			firstRun = false
 		}
 
-		// Google kills sessions after ~5m55s.
-		// Proactive reconnect at 5 minutes — staggered so only one camera at a time.
-		// Brief ~3 second gap per camera, but no artifacts.
 		select {
-		case err = <-done:
+		case err := <-conn.done:
+			// Connection died — loop will reconnect
 			log.Printf("[%s] connection dropped: %v", cs.name, err)
-		case <-time.After(waitTime):
-			log.Printf("[%s] proactive reconnect (staggered)", cs.name)
-		}
+			conn.pc.Close()
 
-		// Clean close: tear down stream, close connection, reconnect fresh
-		cs.mu.Lock()
-		if cs.stream != nil {
-			cs.stream.Close()
-			cs.stream = nil
+		case <-time.After(waitTime):
+			// Seamless handoff: start new connection while old is still streaming
+			log.Printf("[%s] seamless handoff starting", cs.name)
+
+			newConn, err := dialWebRTC(cs, cookies, apiKey)
+			if err != nil {
+				log.Printf("[%s] handoff failed: %v — old still streaming", cs.name, err)
+				// Old connection will die on its own, loop will catch it
+				<-conn.done
+				conn.pc.Close()
+				continue
+			}
+
+			// Wait for IDR keyframe on the new connection before swapping
+			idrPkts := waitForIDR(newConn.pkts, 10*time.Second)
+			if idrPkts == nil {
+				log.Printf("[%s] no IDR on new connection — aborting handoff", cs.name)
+				newConn.pc.Close()
+				<-conn.done
+				conn.pc.Close()
+				continue
+			}
+
+			// ATOMIC SWAP: increment generation (old writer stops), write IDR, new writer starts
+			newGen := cs.gen.Add(1)
+
+			// Write buffered IDR packets (includes SPS/PPS) to the persistent stream
+			cs.mu.RLock()
+			s := cs.stream
+			m := cs.media
+			cs.mu.RUnlock()
+			for _, pkt := range idrPkts {
+				func() {
+					defer func() { recover() }()
+					s.WritePacketRTP(m, pkt)
+				}()
+			}
+
+			// Start forwarding from new connection
+			go forwardPackets(cs, newConn, newGen)
+			log.Printf("[%s] seamless handoff done (gen %d → %d)", cs.name, myGen, newGen)
+
+			// Close old connection (its forwardPackets goroutine will exit because gen changed)
+			conn.pc.Close()
+
+			// Loop with new connection
+			conn = newConn
+			myGen = newGen
+			continue
 		}
-		cs.mu.Unlock()
-		pc.Close()
 	}
 }
 
-func connectCamera(cs *cameraStream, server *gortsplib.Server, cookies map[string]string, apiKey string) (*webrtc.PeerConnection, chan error, error) {
+// forwardPackets reads from a WebRTC connection and writes to the RTSP stream.
+// Stops when the connection dies or the generation changes (another writer took over).
+func forwardPackets(cs *cameraStream, conn *webrtcConn, myGen int64) {
+	var packets, totalBytes, frames uint64
+	var lastTimestamp uint32
+	start := time.Now()
+	statsTicker := time.NewTicker(10 * time.Second)
+	defer statsTicker.Stop()
+
+	go func() {
+		for range statsTicker.C {
+			if cs.gen.Load() != myGen {
+				return
+			}
+			elapsed := time.Since(start).Seconds()
+			if elapsed > 0 && frames > 0 {
+				log.Printf("[%s] gen%d — %.1ffps %.2fMbps (%d frames)",
+					cs.name, myGen, float64(frames)/elapsed,
+					float64(totalBytes)*8/elapsed/1e6, frames)
+			}
+		}
+	}()
+
+	for pkt := range conn.pkts {
+		// Check if we're still the active writer
+		if cs.gen.Load() != myGen {
+			return // Another connection took over — exit silently
+		}
+
+		packets++
+		totalBytes += uint64(len(pkt.Payload))
+		if pkt.Timestamp != lastTimestamp {
+			frames++
+			lastTimestamp = pkt.Timestamp
+		}
+
+		cs.mu.RLock()
+		s := cs.stream
+		m := cs.media
+		cs.mu.RUnlock()
+
+		if s != nil && m != nil {
+			func() {
+				defer func() { recover() }()
+				s.WritePacketRTP(m, pkt)
+			}()
+		}
+	}
+}
+
+// waitForIDR reads packets from the channel until it finds an IDR keyframe.
+// Returns all packets from the SPS/PPS through the complete IDR frame.
+// Returns nil on timeout.
+func waitForIDR(pkts chan *pionrtp.Packet, timeout time.Duration) []*pionrtp.Packet {
+	deadline := time.After(timeout)
+	var buf []*pionrtp.Packet
+	gotSPS := false
+
+	for {
+		select {
+		case pkt, ok := <-pkts:
+			if !ok {
+				return nil
+			}
+			nalType := getNALType(pkt.Payload)
+
+			if nalType == 7 { // SPS
+				gotSPS = true
+				buf = buf[:0] // reset buffer, start collecting from SPS
+			}
+			if gotSPS {
+				buf = append(buf, pkt)
+			}
+			if gotSPS && nalType == 5 { // IDR — we have SPS + PPS + IDR
+				return buf
+			}
+		case <-deadline:
+			return nil
+		}
+	}
+}
+
+// dialWebRTC establishes a WebRTC connection to Google Foyer and returns
+// a packet channel. Does NOT touch the RTSP stream.
+func dialWebRTC(cs *cameraStream, cookies map[string]string, apiKey string) (*webrtcConn, error) {
 	log.Printf("[%s] connecting to %s", cs.name, cs.config.DeviceID)
 
-	// Auth
 	origin := "https://home.google.com"
 	ts := time.Now().Unix()
 	h := sha1.New()
@@ -231,7 +390,6 @@ func connectCamera(cs *cameraStream, server *gortsplib.Server, cookies map[strin
 		cookieStr += k + "=" + v
 	}
 
-	// Pion MediaEngine with Chrome-like codecs + extensions
 	m := &webrtc.MediaEngine{}
 	m.RegisterDefaultCodecs()
 	for _, ext := range []string{
@@ -263,116 +421,45 @@ func connectCamera(cs *cameraStream, server *gortsplib.Server, cookies map[strin
 		ICEServers: []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}},
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("PeerConnection: %w", err)
+		return nil, fmt.Errorf("PeerConnection: %w", err)
 	}
-	cs.pc = pc
 
 	pc.CreateDataChannel("dc", &webrtc.DataChannelInit{ID: uint16Ptr(1)})
 	pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendrecv})
 	pc.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendrecv})
 
-	// Wait for tracks and feed into RTSP stream
+	pkts := make(chan *pionrtp.Packet, 300)
 	done := make(chan error, 1)
 	trackReady := make(chan struct{}, 1)
 
 	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("[%s] recovered from panic in track handler: %v", cs.name, r)
-				done <- fmt.Errorf("panic: %v", r)
-			}
-		}()
+		if track.Kind() != webrtc.RTPCodecTypeVideo {
+			return
+		}
+		log.Printf("[%s] track: %s codec=%s", cs.name, track.Kind(), track.Codec().MimeType)
 
-		codec := track.Codec()
-		log.Printf("[%s] track: %s codec=%s pt=%d", cs.name, track.Kind(), codec.MimeType, codec.PayloadType)
+		// Send PLI for fast keyframe
+		pc.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: uint32(track.SSRC())}})
 
-		if track.Kind() == webrtc.RTPCodecTypeVideo {
-			// Create RTSP stream with H.264 format
-			forma := &format.H264{
-				PayloadTyp:        uint8(codec.PayloadType),
-				PacketizationMode: 1,
-			}
-			media := &description.Media{
-				Type:    description.MediaTypeVideo,
-				Formats: []format.Format{forma},
-			}
-			cs.mu.Lock()
-			cs.media = media
-			stream := &gortsplib.ServerStream{
-				Server: server,
-				Desc:   &description.Session{Medias: []*description.Media{media}},
-			}
-			err := stream.Initialize()
+		select {
+		case trackReady <- struct{}{}:
+		default:
+		}
+
+		for {
+			pkt, _, err := track.ReadRTP()
 			if err != nil {
-				cs.mu.Unlock()
-				log.Printf("[%s] stream init error: %v", cs.name, err)
+				close(pkts)
+				done <- fmt.Errorf("ReadRTP: %w", err)
 				return
 			}
-			cs.stream = stream
-			cs.mu.Unlock()
-
-			log.Printf("[%s] RTSP stream ready", cs.name)
-
-			// Signal ready
-			select {
-			case trackReady <- struct{}{}:
-			default:
+			if len(pkt.Payload) < 2 {
+				continue
 			}
-
-			// Send PLI
-			pc.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: uint32(track.SSRC())}})
-
-			// Forward RTP packets and log stats
-			var packets, totalBytes uint64
-			var frames uint64
-			var lastTimestamp uint32
-			var firstPkt time.Time
-			statsTimer := time.NewTicker(10 * time.Second)
-			defer statsTimer.Stop()
-
-			go func() {
-				for range statsTimer.C {
-					elapsed := time.Since(firstPkt).Seconds()
-					if elapsed > 0 && frames > 0 {
-						fps := float64(frames) / elapsed
-						mbps := float64(totalBytes) * 8 / elapsed / 1e6
-						log.Printf("[%s] %s %dx — %.1ffps %.2fMbps (%d frames, %d pkts)",
-							cs.name, codec.MimeType, 0, fps, mbps, frames, packets)
-					}
-				}
-			}()
-
-			for {
-				pkt, _, err := track.ReadRTP()
-				if err != nil {
-					done <- fmt.Errorf("ReadRTP: %w", err)
-					return
-				}
-				if len(pkt.Payload) < 2 {
-					continue
-				}
-
-				if firstPkt.IsZero() {
-					firstPkt = time.Now()
-				}
-				packets++
-				totalBytes += uint64(len(pkt.Payload))
-				if pkt.Timestamp != lastTimestamp {
-					frames++
-					lastTimestamp = pkt.Timestamp
-				}
-
-				cs.mu.RLock()
-				s := cs.stream
-				m := cs.media
-				cs.mu.RUnlock()
-
-				if s != nil && m != nil {
-					func() {
-						defer func() { recover() }()
-						s.WritePacketRTP(m, pkt)
-					}()
-				}
+			select {
+			case pkts <- pkt:
+			default:
+				// Drop packet if channel full (reader too slow)
 			}
 		}
 	})
@@ -384,13 +471,11 @@ func connectCamera(cs *cameraStream, server *gortsplib.Server, cookies map[strin
 		}
 	})
 
-	// Create offer
 	offer, _ := pc.CreateOffer(nil)
 	gatherComplete := webrtc.GatheringCompletePromise(pc)
 	pc.SetLocalDescription(offer)
 	<-gatherComplete
 
-	// Call Foyer API
 	resolution := cs.config.Resolution
 	if resolution == 0 {
 		resolution = 3
@@ -412,56 +497,40 @@ func connectCamera(cs *cameraStream, server *gortsplib.Server, cookies map[strin
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		pc.Close()
-		return nil, nil, fmt.Errorf("Foyer API: %w", err)
+		return nil, fmt.Errorf("Foyer API: %w", err)
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 
 	if resp.StatusCode != 200 {
 		pc.Close()
-		return nil, nil, fmt.Errorf("Foyer %d: %s", resp.StatusCode, string(body[:min(len(body), 100)]))
+		return nil, fmt.Errorf("Foyer %d: %s", resp.StatusCode, string(body[:min(len(body), 100)]))
 	}
 
 	var answer struct{ SDP string `json:"sdp"` }
 	json.Unmarshal(body, &answer)
 
-	// Log what Foyer offered
-	var answerCodecs []string
-	for _, line := range strings.Split(answer.SDP, "\n") {
-		if strings.Contains(line, "rtpmap") && !strings.Contains(line, "rtx") &&
-			!strings.Contains(line, "red") && !strings.Contains(line, "ulpfec") {
-			answerCodecs = append(answerCodecs, strings.TrimSpace(line))
-		}
-	}
 	hasTWCC := strings.Contains(answer.SDP, "transport-wide-cc")
-	log.Printf("[%s] foyer answered: %d codecs, twcc=%v", cs.name, len(answerCodecs), hasTWCC)
-	for _, c := range answerCodecs {
-		log.Printf("[%s]   %s", cs.name, c)
-	}
+	log.Printf("[%s] foyer answered: twcc=%v", cs.name, hasTWCC)
 
 	err = pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: answer.SDP})
 	if err != nil {
 		pc.Close()
-		return nil, nil, fmt.Errorf("SetRemoteDescription: %w", err)
+		return nil, fmt.Errorf("SetRemoteDescription: %w", err)
 	}
 
-	log.Printf("[%s] negotiated, waiting for video...", cs.name)
-
-	// Wait for either track ready or failure
+	// Wait for video track
 	select {
 	case <-trackReady:
-		log.Printf("[%s] streaming → rtsp://localhost%s/%s", cs.name, server.RTSPAddress, cs.name)
 	case err := <-done:
 		pc.Close()
-		return nil, nil, err
+		return nil, err
 	case <-time.After(15 * time.Second):
 		pc.Close()
-		return nil, nil, fmt.Errorf("timeout waiting for video track")
+		return nil, fmt.Errorf("timeout waiting for video track")
 	}
 
-	// Return the PeerConnection and done channel — caller manages lifecycle
-	// for make-before-break seamless reconnection
-	return pc, done, nil
+	return &webrtcConn{pc: pc, pkts: pkts, done: done}, nil
 }
 
 func uint16Ptr(v uint16) *uint16 { return &v }
